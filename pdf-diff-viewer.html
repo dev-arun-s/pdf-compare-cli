@@ -142,11 +142,10 @@
   .panel-filename { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
 
   .canvas-scroll {
-    flex: 1; overflow-y: auto; overflow-x: auto; padding: 16px;
+    flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px;
     background: #0a0a0c; scrollbar-width: thin; scrollbar-color: var(--border) transparent;
-    display: flex; justify-content: center; align-items: flex-start;
   }
-  .canvas-wrapper { position: relative; display: inline-block; box-shadow: 0 8px 40px rgba(0,0,0,0.6); flex-shrink: 0; }
+  .canvas-wrapper { position: relative; display: block; box-shadow: 0 4px 24px rgba(0,0,0,0.6); margin: 0 auto; }
   canvas { display: block; }
   .diff-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
 
@@ -264,7 +263,6 @@
 <script>
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-const SCALE = 1.6;
 let pdf1 = null, pdf2 = null;
 let currentPage = 1, totalPages = 1;
 let isSyncing = false;
@@ -330,13 +328,13 @@ async function renderPage(pageNum) {
   document.getElementById('tdpPage').textContent = pageNum;
 
   const [r1, r2] = await Promise.all([
-    renderPDFPage(pdf1, pageNum, 'canvas1', 'wrapper1'),
-    renderPDFPage(pdf2, pageNum, 'canvas2', 'wrapper2'),
+    renderPDFPage(pdf1, pageNum, 'canvas1', 'wrapper1', 'scroll1'),
+    renderPDFPage(pdf2, pageNum, 'canvas2', 'wrapper2', 'scroll2'),
   ]);
 
   const [words1, words2] = await Promise.all([
-    extractWords(pdf1, pageNum),
-    extractWords(pdf2, pageNum),
+    extractWords(pdf1, pageNum, 'scroll1'),
+    extractWords(pdf2, pageNum, 'scroll2'),
   ]);
 
   const textDiff  = diffWords(words1, words2);
@@ -362,26 +360,36 @@ async function renderPage(pageNum) {
   document.getElementById('statWordAdd').textContent = textDiff.added.length;
 }
 
-async function renderPDFPage(pdf, pageNum, canvasId, wrapperId) {
+function getPanelWidth(scrollId) {
+  const el = document.getElementById(scrollId);
+  return Math.max(el.clientWidth - 24, 200); // subtract padding, minimum 200
+}
+
+async function renderPDFPage(pdf, pageNum, canvasId, wrapperId, scrollId) {
   const canvas = document.getElementById(canvasId);
   const ctx = canvas.getContext('2d');
 
   if (pageNum > pdf.numPages) {
-    canvas.width = 794; canvas.height = 1123;
+    const pw = getPanelWidth(scrollId);
+    canvas.width = pw; canvas.height = Math.round(pw * 1.414);
     ctx.fillStyle = '#111114'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#333'; ctx.font = '18px Syne'; ctx.textAlign = 'center';
+    ctx.fillStyle = '#444'; ctx.font = '16px sans-serif'; ctx.textAlign = 'center';
     ctx.fillText('(no page)', canvas.width / 2, canvas.height / 2);
     syncWrapper(wrapperId, canvas);
-    return { imgData: ctx.getImageData(0, 0, canvas.width, canvas.height), viewport: null };
+    return { imgData: ctx.getImageData(0, 0, canvas.width, canvas.height), viewport: null, scale: 1 };
   }
 
   const page = await pdf.getPage(pageNum);
-  const viewport = page.getViewport({ scale: SCALE });
-  canvas.width = viewport.width; canvas.height = viewport.height;
+  const base = page.getViewport({ scale: 1 });
+  const scale = getPanelWidth(scrollId) / base.width;
+  const viewport = page.getViewport({ scale });
+
+  canvas.width  = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
   ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport }).promise;
   syncWrapper(wrapperId, canvas);
-  return { imgData: ctx.getImageData(0, 0, canvas.width, canvas.height), viewport };
+  return { imgData: ctx.getImageData(0, 0, canvas.width, canvas.height), viewport, scale };
 }
 
 function syncWrapper(wrapperId, canvas) {
@@ -393,40 +401,31 @@ function syncWrapper(wrapperId, canvas) {
 // ── Text extraction ───────────────────────────────────────────────────────────
 // Returns array of { str, x, y, w, h } in SCALED canvas-space coordinates
 
-async function extractWords(pdf, pageNum) {
+async function extractWords(pdf, pageNum, scrollId) {
   if (pageNum > pdf.numPages) return [];
   const page = await pdf.getPage(pageNum);
-  const viewport = page.getViewport({ scale: SCALE });
+  const base = page.getViewport({ scale: 1 });
+  const scale = getPanelWidth(scrollId) / base.width;
+  const viewport = page.getViewport({ scale });
   const content = await page.getTextContent();
   const words = [];
 
   for (const item of content.items) {
     if (!item.str || !item.str.trim()) continue;
-
-    // Transform item position into canvas space
     const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-    const canvasX  = tx[4];
-    const canvasY  = tx[5];
-    const scaleX   = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
-    const scaleY   = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]);
-    const itemW    = item.width  * scaleX;
-    const itemH    = item.height * Math.abs(scaleY) || 12 * SCALE;
-
-    // Split tokens and distribute bounding boxes proportionally by char count
-    const tokens = item.str.split(/(\s+)/);
+    const canvasX = tx[4];
+    const canvasY = tx[5];
+    const scaleX  = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
+    const scaleY  = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]);
+    const itemW   = item.width  * scaleX;
+    const itemH   = item.height * Math.abs(scaleY) || 12 * scale;
+    const tokens  = item.str.split(/(\s+)/);
     const totalChars = item.str.length || 1;
     let cx = canvasX;
-
     for (const token of tokens) {
       const tw = (token.length / totalChars) * itemW;
       if (token.trim()) {
-        words.push({
-          str: token.trim(),
-          x: cx,
-          y: canvasY - itemH,   // PDF y-axis is bottom-up; canvas is top-down
-          w: tw,
-          h: itemH,
-        });
+        words.push({ str: token.trim(), x: cx, y: canvasY - itemH, w: tw, h: itemH });
       }
       cx += tw;
     }
@@ -687,6 +686,14 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 
 setupDropZone(document.getElementById('drop1'), document.getElementById('file1'), 1);
 setupDropZone(document.getElementById('drop2'), document.getElementById('file2'), 2);
+
+// Re-render on resize so pages always fill their panels
+let resizeTimer;
+window.addEventListener('resize', () => {
+  if (!pdf1 || !pdf2) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => renderPage(currentPage), 150);
+});
 </script>
 </body>
 </html>
