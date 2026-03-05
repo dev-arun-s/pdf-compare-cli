@@ -339,10 +339,10 @@ async function renderPage(pageNum) {
   ]);
 
   const textDiff  = diffWords(words1, words2);
-  // Compare image regions by cropping from the already-rendered canvases
+  // Image diff: uses a separate fixed-scale offscreen render for fair comparison
   const canvas1   = document.getElementById('canvas1');
   const canvas2   = document.getElementById('canvas2');
-  const imageDiff = diffImages(boxes1, boxes2, canvas1, canvas2);
+  const imageDiff = await diffImages(boxes1, boxes2, pdf1, pdf2, pageNum);
 
   clearOverlay('overlay1'); clearOverlay('overlay2');
   setOverlaySize('overlay1', 'canvas1'); setOverlaySize('overlay2', 'canvas2');
@@ -350,8 +350,8 @@ async function renderPage(pageNum) {
   if (diffMode !== 'sidebar') {
     applyWordHighlights('overlay1', textDiff.removed, r1.viewport, 'text-changed');
     applyWordHighlights('overlay2', textDiff.added,   r2.viewport, 'text-changed');
-    applyImageHighlights('overlay1', imageDiff.changed1);
-    applyImageHighlights('overlay2', imageDiff.changed2);
+    applyImageHighlights('overlay1', imageDiff.changed1, canvas1);
+    applyImageHighlights('overlay2', imageDiff.changed2, canvas2);
   }
 
   renderTextDiffSidebar(textDiff, imageDiff);
@@ -501,7 +501,6 @@ async function extractImageBBoxes(pdf, pageNum, scrollId) {
     const opList = await page.getOperatorList();
     const { OPS } = pdfjsLib;
 
-    // Track the transform stack to compute each image's position in canvas space
     const stack = [];
     let ctm = [1, 0, 0, 1, 0, 0];
 
@@ -511,7 +510,7 @@ async function extractImageBBoxes(pdf, pageNum, scrollId) {
       OPS.paintImageMaskXObject,
       OPS.paintJpegXObject,
       OPS.paintSolidColorImageMask,
-    ].filter(Boolean)); // guard against undefined OPS entries
+    ].filter(Boolean));
 
     for (let i = 0; i < opList.fnArray.length; i++) {
       const fn  = opList.fnArray[i];
@@ -524,17 +523,19 @@ async function extractImageBBoxes(pdf, pageNum, scrollId) {
       } else if (fn === OPS.transform) {
         ctm = mat_mul(ctm, arg);
       } else if (imageOps.has(fn)) {
-        // Full transform: viewport.transform × current CTM
         const M = mat_mul(viewport.transform, ctm);
-
-        // A PDF image occupies the unit square [0,1]×[0,1]
         const corners = [[0,0],[1,0],[1,1],[0,1]].map(p => mat_apply(M, p));
         const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
         const x = Math.min(...xs), y = Math.min(...ys);
         const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
-
         if (w >= 4 && h >= 4) {
-          boxes.push({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
+          // Store as fractions of page size so we can re-apply at any render scale
+          boxes.push({
+            xFrac: Math.min(...xs) / viewport.width,
+            yFrac: Math.min(...ys) / viewport.height,
+            wFrac: w / viewport.width,
+            hFrac: h / viewport.height,
+          });
         }
       }
     }
@@ -558,64 +559,82 @@ function mat_apply(m, pt) {
   return [m[0]*pt[0] + m[2]*pt[1] + m[4], m[1]*pt[0] + m[3]*pt[1] + m[5]];
 }
 
-// Crop a bounding box from a rendered canvas into an offscreen canvas
-function cropRegion(sourceCanvas, x, y, w, h) {
-  const cw = Math.max(1, Math.min(w, sourceCanvas.width  - x));
-  const ch = Math.max(1, Math.min(h, sourceCanvas.height - y));
-  if (cw <= 0 || ch <= 0) return null;
+// Render a single page to an offscreen canvas at a fixed resolution for fair comparison
+const IMG_COMPARE_SCALE = 1.5; // fixed scale — same for both PDFs
+async function renderPageOffscreen(pdf, pageNum) {
+  if (pageNum > pdf.numPages) return null;
+  const page = await pdf.getPage(pageNum);
+  const viewport = page.getViewport({ scale: IMG_COMPARE_SCALE });
+  const canvas = document.createElement('canvas');
+  canvas.width  = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return { canvas, viewport };
+}
+
+// Crop a bbox (expressed as fractions) from a canvas
+function cropFrac(canvas, xFrac, yFrac, wFrac, hFrac) {
+  const x = Math.round(xFrac * canvas.width);
+  const y = Math.round(yFrac * canvas.height);
+  const w = Math.max(1, Math.round(wFrac * canvas.width));
+  const h = Math.max(1, Math.round(hFrac * canvas.height));
+  const cx = Math.min(w, canvas.width  - x);
+  const cy = Math.min(h, canvas.height - y);
+  if (cx <= 0 || cy <= 0) return null;
   const off = document.createElement('canvas');
-  off.width = cw; off.height = ch;
-  off.getContext('2d').drawImage(sourceCanvas, x, y, cw, ch, 0, 0, cw, ch);
-  return off.getContext('2d').getImageData(0, 0, cw, ch);
+  off.width = cx; off.height = cy;
+  off.getContext('2d').drawImage(canvas, x, y, cx, cy, 0, 0, cx, cy);
+  return off;
 }
 
-// Compare two ImageData objects for pixel-level differences.
-// Resamples to a common size so that minor scale differences don't matter.
-function regionsDiffer(pd1, pd2) {
-  const COMPARE_SIZE = 64; // downsample both regions to 64×64 for comparison
-  const THRESHOLD    = 20; // per-channel delta to count as a changed pixel
-  const MAX_RATIO    = 0.02; // flag if >2% of sampled pixels differ
+// Robust image comparison: compute mean absolute difference per channel
+// after normalising both crops to the same size.
+function regionsDiffer(cropCanvas1, cropCanvas2) {
+  const SIZE = 128; // compare at 128×128 — enough detail, removes tiny scale noise
 
-  const off1 = document.createElement('canvas');
-  const off2 = document.createElement('canvas');
-  off1.width = off2.width = COMPARE_SIZE;
-  off1.height = off2.height = COMPARE_SIZE;
+  const c1 = document.createElement('canvas'); c1.width = c1.height = SIZE;
+  const c2 = document.createElement('canvas'); c2.width = c2.height = SIZE;
 
-  // Draw source ImageData into their own temp canvas, then scale into compare canvas
-  const tmp1 = document.createElement('canvas');
-  tmp1.width = pd1.width; tmp1.height = pd1.height;
-  tmp1.getContext('2d').putImageData(pd1, 0, 0);
+  // Use crisp nearest-neighbour for black-and-white images (barcodes/QR codes),
+  // and smooth for photos — imageSmoothingQuality doesn't matter much here.
+  const ctx1 = c1.getContext('2d'); ctx1.imageSmoothingEnabled = true;
+  const ctx2 = c2.getContext('2d'); ctx2.imageSmoothingEnabled = true;
+  ctx1.drawImage(cropCanvas1, 0, 0, SIZE, SIZE);
+  ctx2.drawImage(cropCanvas2, 0, 0, SIZE, SIZE);
 
-  const tmp2 = document.createElement('canvas');
-  tmp2.width = pd2.width; tmp2.height = pd2.height;
-  tmp2.getContext('2d').putImageData(pd2, 0, 0);
+  const d1 = ctx1.getImageData(0, 0, SIZE, SIZE).data;
+  const d2 = ctx2.getImageData(0, 0, SIZE, SIZE).data;
 
-  off1.getContext('2d').drawImage(tmp1, 0, 0, COMPARE_SIZE, COMPARE_SIZE);
-  off2.getContext('2d').drawImage(tmp2, 0, 0, COMPARE_SIZE, COMPARE_SIZE);
-
-  const d1 = off1.getContext('2d').getImageData(0, 0, COMPARE_SIZE, COMPARE_SIZE).data;
-  const d2 = off2.getContext('2d').getImageData(0, 0, COMPARE_SIZE, COMPARE_SIZE).data;
-
-  let diff = 0;
-  const total = COMPARE_SIZE * COMPARE_SIZE;
+  // Compute mean absolute difference across all pixels and channels (R,G,B only)
+  let totalDiff = 0;
+  const pixels = SIZE * SIZE;
   for (let i = 0; i < d1.length; i += 4) {
-    if (
-      Math.abs(d1[i]   - d2[i])   > THRESHOLD ||
-      Math.abs(d1[i+1] - d2[i+1]) > THRESHOLD ||
-      Math.abs(d1[i+2] - d2[i+2]) > THRESHOLD
-    ) {
-      diff++;
-      if (diff / total > MAX_RATIO) return true;
-    }
+    totalDiff += Math.abs(d1[i]   - d2[i]);
+    totalDiff += Math.abs(d1[i+1] - d2[i+1]);
+    totalDiff += Math.abs(d1[i+2] - d2[i+2]);
   }
-  return diff / total > MAX_RATIO;
+  const mad = totalDiff / (pixels * 3); // mean absolute difference, 0–255
+
+  // Flag as different only if MAD > 8 (out of 255).
+  // This is very tolerant of JPEG compression artefacts and minor rendering
+  // differences, but reliably catches a changed barcode or photo.
+  return mad > 8;
 }
 
-// Compare image regions cropped from both rendered canvases.
-// Returns { changed1, changed2, count }
-function diffImages(boxes1, boxes2, canvas1, canvas2) {
+// Compare image regions using a shared fixed-scale offscreen render of each page
+async function diffImages(boxes1, boxes2, pdf1, pdf2, pageNum) {
   const changed1 = [], changed2 = [];
   const len = Math.max(boxes1.length, boxes2.length);
+  if (len === 0) return { changed1, changed2, count: 0 };
+
+  // Render both pages at the same fixed scale for a fair pixel comparison
+  const [off1, off2] = await Promise.all([
+    renderPageOffscreen(pdf1, pageNum),
+    renderPageOffscreen(pdf2, pageNum),
+  ]);
 
   for (let i = 0; i < len; i++) {
     const b1 = boxes1[i], b2 = boxes2[i];
@@ -624,10 +643,12 @@ function diffImages(boxes1, boxes2, canvas1, canvas2) {
       changed2.push(b2);
     } else if (b1 && !b2) {
       changed1.push(b1);
-    } else if (b1 && b2) {
-      const pd1 = cropRegion(canvas1, b1.x, b1.y, b1.w, b1.h);
-      const pd2 = cropRegion(canvas2, b2.x, b2.y, b2.w, b2.h);
-      if (!pd1 || !pd2 || regionsDiffer(pd1, pd2)) {
+    } else {
+      // Both exist — crop from the fixed-scale offscreen canvases and compare
+      const crop1 = off1 ? cropFrac(off1.canvas, b1.xFrac, b1.yFrac, b1.wFrac, b1.hFrac) : null;
+      const crop2 = off2 ? cropFrac(off2.canvas, b2.xFrac, b2.yFrac, b2.wFrac, b2.hFrac) : null;
+
+      if (!crop1 || !crop2 || regionsDiffer(crop1, crop2)) {
         changed1.push(b1);
         changed2.push(b2);
       }
@@ -637,13 +658,24 @@ function diffImages(boxes1, boxes2, canvas1, canvas2) {
   return { changed1, changed2, count: Math.max(changed1.length, changed2.length) };
 }
 
-function applyImageHighlights(overlayId, rects) {
+// Convert fractional bbox back to canvas-pixel coords for overlay rendering
+function fracToPixels(box, canvas) {
+  return {
+    x: Math.round(box.xFrac * canvas.width),
+    y: Math.round(box.yFrac * canvas.height),
+    w: Math.round(box.wFrac * canvas.width),
+    h: Math.round(box.hFrac * canvas.height),
+  };
+}
+
+function applyImageHighlights(overlayId, rects, canvas) {
   if (!rects || !rects.length) return;
   const overlay = document.getElementById(overlayId);
   for (const r of rects) {
+    const px = fracToPixels(r, canvas);
     const el = document.createElement('div');
     el.className = 'diff-rect image-changed';
-    el.style.cssText = `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px`;
+    el.style.cssText = `left:${px.x}px;top:${px.y}px;width:${px.w}px;height:${px.h}px`;
     el.title = 'Image changed';
     overlay.appendChild(el);
   }
