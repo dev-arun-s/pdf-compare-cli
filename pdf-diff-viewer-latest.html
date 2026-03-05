@@ -65,8 +65,7 @@
   .diff-legend { display: flex; gap: 10px; font-size: 11px; font-family: 'DM Mono', monospace; color: var(--muted); }
   .legend-item { display: flex; align-items: center; gap: 4px; }
   .legend-dot { width: 9px; height: 9px; border-radius: 2px; }
-  .legend-added { background: var(--added-border); }
-  .legend-removed { background: var(--removed-border); }
+  .legend-changed { background: #ffd700; }
 
   .controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
   .page-nav { display: flex; align-items: center; gap: 6px; font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); }
@@ -150,10 +149,7 @@
   .diff-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
 
   .diff-rect { position: absolute; border-radius: 2px; }
-  .diff-rect.pixel-added   { background: var(--added);   border: 1.5px solid var(--added-border);   box-shadow: 0 0 6px rgba(80,220,120,0.2); }
-  .diff-rect.pixel-removed { background: var(--removed); border: 1.5px solid var(--removed-border); box-shadow: 0 0 6px rgba(255,80,100,0.2); }
-  .diff-rect.text-added    { background: var(--text-added);   border: 1.5px solid var(--text-added-border);   border-radius: 3px; }
-  .diff-rect.text-removed  { background: var(--text-removed); border: 1.5px solid var(--text-removed-border); border-radius: 3px; }
+  .diff-rect.text-changed  { background: rgba(255, 220, 0, 0.35); border: 1.5px solid rgba(255, 200, 0, 0.9); border-radius: 3px; box-shadow: 0 0 6px rgba(255,210,0,0.25); }
 
   .stats-bar {
     padding: 7px 14px; background: var(--surface); border-top: 1px solid var(--border);
@@ -173,14 +169,13 @@
   <div class="logo">PDF<span>diff</span></div>
 
   <div class="mode-tabs" id="modeTabs" style="display:none">
-    <button class="mode-tab active" data-mode="both">Visual + Text</button>
-    <button class="mode-tab" data-mode="pixel">Visual only</button>
-    <button class="mode-tab" data-mode="text">Text only</button>
+    <button class="mode-tab active" data-mode="both">Highlights + Sidebar</button>
+    <button class="mode-tab" data-mode="highlights">Highlights only</button>
+    <button class="mode-tab" data-mode="sidebar">Sidebar only</button>
   </div>
 
   <div class="diff-legend" id="diffLegend" style="display:none">
-    <div class="legend-item"><div class="legend-dot legend-removed"></div>Removed</div>
-    <div class="legend-item"><div class="legend-dot legend-added"></div>Added</div>
+    <div class="legend-item"><div class="legend-dot legend-changed"></div>Changed words</div>
   </div>
 
   <div class="controls">
@@ -254,8 +249,8 @@
 
   <div class="stats-bar">
     <div class="stat">Page: <span class="stat-val" id="statPage">-</span></div>
-    <div class="stat">Visual blocks: <span class="stat-val removed-val" id="statPixRem">0</span>↓ <span class="stat-val added-val" id="statPixAdd">0</span>↑</div>
-    <div class="stat">Words: <span class="stat-val removed-val" id="statWordRem">0</span> deleted · <span class="stat-val added-val" id="statWordAdd">0</span> inserted</div>
+    <div class="stat">Words removed: <span class="stat-val removed-val" id="statWordRem">0</span></div>
+    <div class="stat">Words added: <span class="stat-val added-val" id="statWordAdd">0</span></div>
     <div class="sync-badge">⟳ SYNCED</div>
   </div>
 </div>
@@ -337,25 +332,19 @@ async function renderPage(pageNum) {
     extractWords(pdf2, pageNum, 'scroll2'),
   ]);
 
-  const textDiff  = diffWords(words1, words2);
-  const pixelDiff = diffMode !== 'text' ? computePixelDiff(r1.imgData, r2.imgData) : { removed: [], added: [] };
+  const textDiff = diffWords(words1, words2);
 
   clearOverlay('overlay1'); clearOverlay('overlay2');
   setOverlaySize('overlay1', 'canvas1'); setOverlaySize('overlay2', 'canvas2');
 
-  if (diffMode !== 'text') {
-    applyRects('overlay1', pixelDiff.removed, 'pixel-removed');
-    applyRects('overlay2', pixelDiff.added,   'pixel-added');
-  }
-  if (diffMode !== 'pixel') {
-    applyWordHighlights('overlay1', textDiff.removed, r1.viewport, 'text-removed');
-    applyWordHighlights('overlay2', textDiff.added,   r2.viewport, 'text-added');
+  if (diffMode !== 'sidebar') {
+    // Yellow highlights on both panels — changed words in OLD and changed words in NEW
+    applyWordHighlights('overlay1', textDiff.removed, r1.viewport, 'text-changed');
+    applyWordHighlights('overlay2', textDiff.added,   r2.viewport, 'text-changed');
   }
 
   renderTextDiffSidebar(textDiff);
 
-  document.getElementById('statPixRem').textContent  = pixelDiff.removed.length;
-  document.getElementById('statPixAdd').textContent  = pixelDiff.added.length;
   document.getElementById('statWordRem').textContent = textDiff.removed.length;
   document.getElementById('statWordAdd').textContent = textDiff.added.length;
 }
@@ -490,16 +479,6 @@ function setOverlaySize(oid, cid) {
   o.style.width = c.width + 'px'; o.style.height = c.height + 'px';
 }
 
-function applyRects(overlayId, rects, cls) {
-  const overlay = document.getElementById(overlayId);
-  for (const r of rects) {
-    const el = document.createElement('div');
-    el.className = `diff-rect ${cls}`;
-    el.style.cssText = `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px`;
-    overlay.appendChild(el);
-  }
-}
-
 function applyWordHighlights(overlayId, wordList, viewport, cls) {
   if (!viewport || !wordList.length) return;
   const overlay = document.getElementById(overlayId);
@@ -512,69 +491,6 @@ function applyWordHighlights(overlayId, wordList, viewport, cls) {
     el.title = word.str;
     overlay.appendChild(el);
   }
-}
-
-// ── Pixel diff ────────────────────────────────────────────────────────────────
-
-function computePixelDiff(img1, img2) {
-  const w = Math.min(img1.width, img2.width), h = Math.min(img1.height, img2.height);
-  const d1 = img1.data, d2 = img2.data;
-  const THRESHOLD = 30, BLOCK = 16;
-  const cols = Math.ceil(w / BLOCK), rows = Math.ceil(h / BLOCK);
-  const diffSet = new Set();
-
-  for (let by = 0; by < rows; by++) {
-    for (let bx = 0; bx < cols; bx++) {
-      let maxD = 0;
-      for (let py = 0; py < BLOCK && by * BLOCK + py < h; py++) {
-        for (let px = 0; px < BLOCK && bx * BLOCK + px < w; px++) {
-          const x = bx * BLOCK + px, y = by * BLOCK + py;
-          const i1 = (y * img1.width + x) * 4, i2 = (y * img2.width + x) * 4;
-          maxD = Math.max(maxD, Math.abs(d1[i1] - d2[i2]), Math.abs(d1[i1+1] - d2[i2+1]), Math.abs(d1[i1+2] - d2[i2+2]));
-        }
-      }
-      if (maxD > THRESHOLD) diffSet.add(`${bx},${by}`);
-    }
-  }
-  const rects = mergeBlocks(diffSet, BLOCK);
-  return { removed: rects, added: rects };
-}
-
-function mergeBlocks(blockSet, bs) {
-  const byRow = {};
-  for (const key of blockSet) {
-    const [bx, by] = key.split(',').map(Number);
-    (byRow[by] = byRow[by] || []).push(bx);
-  }
-  const rects = [];
-  for (const [rowStr, cols] of Object.entries(byRow)) {
-    const by = parseInt(rowStr);
-    cols.sort((a, b) => a - b);
-    let s = cols[0], p = cols[0];
-    for (let i = 1; i <= cols.length; i++) {
-      if (i === cols.length || cols[i] !== p + 1) {
-        rects.push({ x: s * bs, y: by * bs, w: (p - s + 1) * bs, h: bs });
-        if (i < cols.length) { s = cols[i]; p = cols[i]; }
-      } else p = cols[i];
-    }
-  }
-  return mergeVertical(rects);
-}
-
-function mergeVertical(rects) {
-  const sorted = [...rects].sort((a, b) => a.x - b.x || a.y - b.y || a.w - b.w);
-  const used = new Set(), merged = [];
-  for (let i = 0; i < sorted.length; i++) {
-    if (used.has(i)) continue;
-    let r = { ...sorted[i] };
-    for (let j = i + 1; j < sorted.length; j++) {
-      if (!used.has(j) && sorted[j].x === r.x && sorted[j].w === r.w && sorted[j].y === r.y + r.h) {
-        r.h += sorted[j].h; used.add(j);
-      }
-    }
-    merged.push(r);
-  }
-  return merged;
 }
 
 // ── Text diff sidebar ─────────────────────────────────────────────────────────
@@ -661,7 +577,8 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
     document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     diffMode = tab.dataset.mode;
-    document.getElementById('textDiffPanel').classList.toggle('hidden', diffMode === 'pixel');
+    // Hide sidebar when highlights-only
+    document.getElementById('textDiffPanel').classList.toggle('hidden', diffMode === 'highlights');
     await renderPage(currentPage);
   });
 });
@@ -682,6 +599,7 @@ document.getElementById('resetBtn').addEventListener('click', () => {
   document.getElementById('file2').value = '';
   diffMode = 'both';
   document.querySelectorAll('.mode-tab').forEach((t, i) => t.classList.toggle('active', i === 0));
+  document.getElementById('textDiffPanel').classList.remove('hidden');
 });
 
 setupDropZone(document.getElementById('drop1'), document.getElementById('file1'), 1);
