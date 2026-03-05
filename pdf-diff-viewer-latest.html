@@ -330,18 +330,19 @@ async function renderPage(pageNum) {
     renderPDFPage(pdf2, pageNum, 'canvas2', 'wrapper2', 'scroll2'),
   ]);
 
-  const [words1, words2] = await Promise.all([
+  // Run text extraction and image bbox detection in parallel
+  const [words1, words2, boxes1, boxes2] = await Promise.all([
     extractWords(pdf1, pageNum, 'scroll1'),
     extractWords(pdf2, pageNum, 'scroll2'),
-  ]);
-
-  const [images1, images2] = await Promise.all([
-    extractImages(pdf1, pageNum, 'scroll1'),
-    extractImages(pdf2, pageNum, 'scroll2'),
+    extractImageBBoxes(pdf1, pageNum, 'scroll1'),
+    extractImageBBoxes(pdf2, pageNum, 'scroll2'),
   ]);
 
   const textDiff  = diffWords(words1, words2);
-  const imageDiff = diffImages(images1, images2);
+  // Compare image regions by cropping from the already-rendered canvases
+  const canvas1   = document.getElementById('canvas1');
+  const canvas2   = document.getElementById('canvas2');
+  const imageDiff = diffImages(boxes1, boxes2, canvas1, canvas2);
 
   clearOverlay('overlay1'); clearOverlay('overlay2');
   setOverlaySize('overlay1', 'canvas1'); setOverlaySize('overlay2', 'canvas2');
@@ -483,149 +484,152 @@ function diffWords(words1, words2) {
 }
 
 // ── Image extraction & diff ───────────────────────────────────────────────────
-// Returns array of { x, y, w, h, pixelData, imgW, imgH } in canvas-space coords
+// Strategy: use the operator list to locate image bounding boxes on the page,
+// then crop those regions directly from the already-rendered canvas for comparison.
+// This is reliable for ALL image types (PNG/JPG/BMP/inline) since PDF.js has
+// already decoded and composited everything onto the canvas correctly.
 
-async function extractImages(pdf, pageNum, scrollId) {
+async function extractImageBBoxes(pdf, pageNum, scrollId) {
   if (pageNum > pdf.numPages) return [];
   const page = await pdf.getPage(pageNum);
   const base = page.getViewport({ scale: 1 });
   const scale = getPanelWidth(scrollId) / base.width;
   const viewport = page.getViewport({ scale });
 
-  const images = [];
+  const boxes = [];
   try {
     const opList = await page.getOperatorList();
     const { OPS } = pdfjsLib;
 
-    // Walk operator list to find paintImageXObject calls and their current transform
-    // We maintain a simple transform stack to get each image's CTM
-    const transformStack = [[1,0,0,1,0,0]];
-    let currentTransform = [1,0,0,1,0,0];
+    // Track the transform stack to compute each image's position in canvas space
+    const stack = [];
+    let ctm = [1, 0, 0, 1, 0, 0];
+
+    const imageOps = new Set([
+      OPS.paintImageXObject,
+      OPS.paintInlineImageXObject,
+      OPS.paintImageMaskXObject,
+      OPS.paintJpegXObject,
+      OPS.paintSolidColorImageMask,
+    ].filter(Boolean)); // guard against undefined OPS entries
 
     for (let i = 0; i < opList.fnArray.length; i++) {
-      const fn = opList.fnArray[i];
-      const args = opList.argsArray[i];
+      const fn  = opList.fnArray[i];
+      const arg = opList.argsArray[i];
 
       if (fn === OPS.save) {
-        transformStack.push([...currentTransform]);
+        stack.push([...ctm]);
       } else if (fn === OPS.restore) {
-        currentTransform = transformStack.pop() || [1,0,0,1,0,0];
+        ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
       } else if (fn === OPS.transform) {
-        // args = [a,b,c,d,e,f] — multiply onto current
-        currentTransform = multiplyMatrix(currentTransform, args);
-      } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
-        // Get image data from page's objs
-        const imgName = args[0];
-        let imgData = null;
-        try {
-          imgData = await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('timeout')), 3000);
-            page.objs.get(imgName, obj => {
-              clearTimeout(timeout);
-              resolve(obj);
-            });
-          });
-        } catch { continue; }
+        ctm = mat_mul(ctm, arg);
+      } else if (imageOps.has(fn)) {
+        // Full transform: viewport.transform × current CTM
+        const M = mat_mul(viewport.transform, ctm);
 
-        if (!imgData || !imgData.data) continue;
-
-        // Map image corners through PDF→canvas transform
-        // PDF image is unit square [0,0]→[1,1] scaled by CTM, then by viewport
-        const ctm = currentTransform;
-        // The full transform = viewport.transform * ctm
-        const vt = viewport.transform; // [sx,0,0,sy,tx,ty] for non-rotated
-        const fullM = multiplyMatrix(vt, ctm);
-
-        // Corners of unit square in canvas space
-        const corners = [
-          applyMatrix(fullM, [0, 0]),
-          applyMatrix(fullM, [1, 0]),
-          applyMatrix(fullM, [1, 1]),
-          applyMatrix(fullM, [0, 1]),
-        ];
+        // A PDF image occupies the unit square [0,1]×[0,1]
+        const corners = [[0,0],[1,0],[1,1],[0,1]].map(p => mat_apply(M, p));
         const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
         const x = Math.min(...xs), y = Math.min(...ys);
         const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
 
-        if (w < 4 || h < 4) continue; // skip tiny/invisible images
-
-        // Render the image to an offscreen canvas at its natural resolution for pixel comparison
-        const imgW = imgData.width, imgH = imgData.height;
-        const offscreen = document.createElement('canvas');
-        offscreen.width = imgW; offscreen.height = imgH;
-        const ctx = offscreen.getContext('2d');
-        const idata = ctx.createImageData(imgW, imgH);
-
-        // imgData.data may be Uint8ClampedArray (RGBA) or Uint8Array (RGB)
-        const src = imgData.data;
-        const channels = src.length / (imgW * imgH);
-        if (channels === 4) {
-          idata.data.set(src);
-        } else if (channels === 3) {
-          for (let p = 0; p < imgW * imgH; p++) {
-            idata.data[p*4]   = src[p*3];
-            idata.data[p*4+1] = src[p*3+1];
-            idata.data[p*4+2] = src[p*3+2];
-            idata.data[p*4+3] = 255;
-          }
-        } else if (channels === 1) {
-          for (let p = 0; p < imgW * imgH; p++) {
-            idata.data[p*4] = idata.data[p*4+1] = idata.data[p*4+2] = src[p];
-            idata.data[p*4+3] = 255;
-          }
-        } else { continue; }
-
-        ctx.putImageData(idata, 0, 0);
-        const pixelData = ctx.getImageData(0, 0, imgW, imgH);
-
-        images.push({ x, y, w, h, pixelData, imgW, imgH, name: imgName });
+        if (w >= 4 && h >= 4) {
+          boxes.push({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
+        }
       }
     }
   } catch (e) {
-    console.warn('Image extraction error:', e);
+    console.warn('BBox extraction error:', e);
   }
-  return images;
+  return boxes;
 }
 
-function multiplyMatrix(m1, m2) {
-  // Both are [a,b,c,d,e,f] representing 2D affine matrix
+function mat_mul(m1, m2) {
   const [a1,b1,c1,d1,e1,f1] = m1;
   const [a2,b2,c2,d2,e2,f2] = m2;
   return [
-    a1*a2 + c1*b2,
-    b1*a2 + d1*b2,
-    a1*c2 + c1*d2,
-    b1*c2 + d1*d2,
-    a1*e2 + c1*f2 + e1,
-    b1*e2 + d1*f2 + f1,
+    a1*a2 + c1*b2, b1*a2 + d1*b2,
+    a1*c2 + c1*d2, b1*c2 + d1*d2,
+    a1*e2 + c1*f2 + e1, b1*e2 + d1*f2 + f1,
   ];
 }
 
-function applyMatrix(m, pt) {
+function mat_apply(m, pt) {
   return [m[0]*pt[0] + m[2]*pt[1] + m[4], m[1]*pt[0] + m[3]*pt[1] + m[5]];
 }
 
-// Compare images from two pages, matching by position index
-// Returns { changed1: [{x,y,w,h}], changed2: [{x,y,w,h}], count }
-function diffImages(images1, images2) {
+// Crop a bounding box from a rendered canvas into an offscreen canvas
+function cropRegion(sourceCanvas, x, y, w, h) {
+  const cw = Math.max(1, Math.min(w, sourceCanvas.width  - x));
+  const ch = Math.max(1, Math.min(h, sourceCanvas.height - y));
+  if (cw <= 0 || ch <= 0) return null;
+  const off = document.createElement('canvas');
+  off.width = cw; off.height = ch;
+  off.getContext('2d').drawImage(sourceCanvas, x, y, cw, ch, 0, 0, cw, ch);
+  return off.getContext('2d').getImageData(0, 0, cw, ch);
+}
+
+// Compare two ImageData objects for pixel-level differences.
+// Resamples to a common size so that minor scale differences don't matter.
+function regionsDiffer(pd1, pd2) {
+  const COMPARE_SIZE = 64; // downsample both regions to 64×64 for comparison
+  const THRESHOLD    = 20; // per-channel delta to count as a changed pixel
+  const MAX_RATIO    = 0.02; // flag if >2% of sampled pixels differ
+
+  const off1 = document.createElement('canvas');
+  const off2 = document.createElement('canvas');
+  off1.width = off2.width = COMPARE_SIZE;
+  off1.height = off2.height = COMPARE_SIZE;
+
+  // Draw source ImageData into their own temp canvas, then scale into compare canvas
+  const tmp1 = document.createElement('canvas');
+  tmp1.width = pd1.width; tmp1.height = pd1.height;
+  tmp1.getContext('2d').putImageData(pd1, 0, 0);
+
+  const tmp2 = document.createElement('canvas');
+  tmp2.width = pd2.width; tmp2.height = pd2.height;
+  tmp2.getContext('2d').putImageData(pd2, 0, 0);
+
+  off1.getContext('2d').drawImage(tmp1, 0, 0, COMPARE_SIZE, COMPARE_SIZE);
+  off2.getContext('2d').drawImage(tmp2, 0, 0, COMPARE_SIZE, COMPARE_SIZE);
+
+  const d1 = off1.getContext('2d').getImageData(0, 0, COMPARE_SIZE, COMPARE_SIZE).data;
+  const d2 = off2.getContext('2d').getImageData(0, 0, COMPARE_SIZE, COMPARE_SIZE).data;
+
+  let diff = 0;
+  const total = COMPARE_SIZE * COMPARE_SIZE;
+  for (let i = 0; i < d1.length; i += 4) {
+    if (
+      Math.abs(d1[i]   - d2[i])   > THRESHOLD ||
+      Math.abs(d1[i+1] - d2[i+1]) > THRESHOLD ||
+      Math.abs(d1[i+2] - d2[i+2]) > THRESHOLD
+    ) {
+      diff++;
+      if (diff / total > MAX_RATIO) return true;
+    }
+  }
+  return diff / total > MAX_RATIO;
+}
+
+// Compare image regions cropped from both rendered canvases.
+// Returns { changed1, changed2, count }
+function diffImages(boxes1, boxes2, canvas1, canvas2) {
   const changed1 = [], changed2 = [];
-  const len = Math.max(images1.length, images2.length);
+  const len = Math.max(boxes1.length, boxes2.length);
 
   for (let i = 0; i < len; i++) {
-    const img1 = images1[i];
-    const img2 = images2[i];
+    const b1 = boxes1[i], b2 = boxes2[i];
 
-    if (!img1 && img2) {
-      // New image added
-      changed2.push({ x: img2.x, y: img2.y, w: img2.w, h: img2.h });
-    } else if (img1 && !img2) {
-      // Image removed
-      changed1.push({ x: img1.x, y: img1.y, w: img1.w, h: img1.h });
-    } else if (img1 && img2) {
-      // Both exist — compare pixel data
-      if (imagesAreDifferent(img1.pixelData, img2.pixelData)) {
-        changed1.push({ x: img1.x, y: img1.y, w: img1.w, h: img1.h });
-        changed2.push({ x: img2.x, y: img2.y, w: img2.w, h: img2.h });
+    if (!b1 && b2) {
+      changed2.push(b2);
+    } else if (b1 && !b2) {
+      changed1.push(b1);
+    } else if (b1 && b2) {
+      const pd1 = cropRegion(canvas1, b1.x, b1.y, b1.w, b1.h);
+      const pd2 = cropRegion(canvas2, b2.x, b2.y, b2.w, b2.h);
+      if (!pd1 || !pd2 || regionsDiffer(pd1, pd2)) {
+        changed1.push(b1);
+        changed2.push(b2);
       }
     }
   }
@@ -633,37 +637,13 @@ function diffImages(images1, images2) {
   return { changed1, changed2, count: Math.max(changed1.length, changed2.length) };
 }
 
-function imagesAreDifferent(pd1, pd2) {
-  // If dimensions differ, definitely different
-  if (pd1.width !== pd2.width || pd1.height !== pd2.height) return true;
-
-  const d1 = pd1.data, d2 = pd2.data;
-  const total = pd1.width * pd1.height;
-  const THRESHOLD = 15;        // per-channel difference to count a pixel as changed
-  const MAX_DIFF_RATIO = 0.01; // flag if >1% of pixels differ
-
-  let diffPixels = 0;
-  const step = 4; // check every pixel (RGBA stride)
-  for (let i = 0; i < d1.length; i += step) {
-    if (
-      Math.abs(d1[i]   - d2[i])   > THRESHOLD ||
-      Math.abs(d1[i+1] - d2[i+1]) > THRESHOLD ||
-      Math.abs(d1[i+2] - d2[i+2]) > THRESHOLD
-    ) {
-      diffPixels++;
-      if (diffPixels / total > MAX_DIFF_RATIO) return true;
-    }
-  }
-  return (diffPixels / total) > MAX_DIFF_RATIO;
-}
-
 function applyImageHighlights(overlayId, rects) {
-  if (!rects.length) return;
+  if (!rects || !rects.length) return;
   const overlay = document.getElementById(overlayId);
   for (const r of rects) {
     const el = document.createElement('div');
     el.className = 'diff-rect image-changed';
-    el.style.cssText = `left:${Math.round(r.x)}px;top:${Math.round(r.y)}px;width:${Math.round(r.w)}px;height:${Math.round(r.h)}px`;
+    el.style.cssText = `left:${r.x}px;top:${r.y}px;width:${r.w}px;height:${r.h}px`;
     el.title = 'Image changed';
     overlay.appendChild(el);
   }
