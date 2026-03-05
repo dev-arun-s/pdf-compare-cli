@@ -149,7 +149,8 @@
   .diff-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
 
   .diff-rect { position: absolute; border-radius: 2px; }
-  .diff-rect.text-changed  { background: rgba(255, 220, 0, 0.35); border: 1.5px solid rgba(255, 200, 0, 0.9); border-radius: 3px; box-shadow: 0 0 6px rgba(255,210,0,0.25); }
+  .diff-rect.text-changed  { background: rgba(255, 220, 0, 0.35);  border: 2px solid rgba(255, 200, 0, 0.9);  border-radius: 3px; box-shadow: 0 0 6px rgba(255,210,0,0.25); }
+  .diff-rect.image-changed { background: rgba(255, 120, 30, 0.22); border: 2px solid rgba(255, 140, 30, 0.95); border-radius: 3px; box-shadow: 0 0 10px rgba(255,130,20,0.35); }
 
   .stats-bar {
     padding: 7px 14px; background: var(--surface); border-top: 1px solid var(--border);
@@ -175,7 +176,8 @@
   </div>
 
   <div class="diff-legend" id="diffLegend" style="display:none">
-    <div class="legend-item"><div class="legend-dot legend-changed"></div>Changed words</div>
+    <div class="legend-item"><div class="legend-dot legend-changed"></div>Changed text</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ff8020"></div>Changed image</div>
   </div>
 
   <div class="controls">
@@ -251,6 +253,7 @@
     <div class="stat">Page: <span class="stat-val" id="statPage">-</span></div>
     <div class="stat">Words removed: <span class="stat-val removed-val" id="statWordRem">0</span></div>
     <div class="stat">Words added: <span class="stat-val added-val" id="statWordAdd">0</span></div>
+    <div class="stat">Images changed: <span class="stat-val" id="statImgChanged" style="color:#ff8020">0</span></div>
     <div class="sync-badge">⟳ SYNCED</div>
   </div>
 </div>
@@ -332,21 +335,29 @@ async function renderPage(pageNum) {
     extractWords(pdf2, pageNum, 'scroll2'),
   ]);
 
-  const textDiff = diffWords(words1, words2);
+  const [images1, images2] = await Promise.all([
+    extractImages(pdf1, pageNum, 'scroll1'),
+    extractImages(pdf2, pageNum, 'scroll2'),
+  ]);
+
+  const textDiff  = diffWords(words1, words2);
+  const imageDiff = diffImages(images1, images2);
 
   clearOverlay('overlay1'); clearOverlay('overlay2');
   setOverlaySize('overlay1', 'canvas1'); setOverlaySize('overlay2', 'canvas2');
 
   if (diffMode !== 'sidebar') {
-    // Yellow highlights on both panels — changed words in OLD and changed words in NEW
     applyWordHighlights('overlay1', textDiff.removed, r1.viewport, 'text-changed');
     applyWordHighlights('overlay2', textDiff.added,   r2.viewport, 'text-changed');
+    applyImageHighlights('overlay1', imageDiff.changed1);
+    applyImageHighlights('overlay2', imageDiff.changed2);
   }
 
-  renderTextDiffSidebar(textDiff);
+  renderTextDiffSidebar(textDiff, imageDiff);
 
-  document.getElementById('statWordRem').textContent = textDiff.removed.length;
-  document.getElementById('statWordAdd').textContent = textDiff.added.length;
+  document.getElementById('statWordRem').textContent    = textDiff.removed.length;
+  document.getElementById('statWordAdd').textContent    = textDiff.added.length;
+  document.getElementById('statImgChanged').textContent = imageDiff.count;
 }
 
 function getPanelWidth(scrollId) {
@@ -471,6 +482,193 @@ function diffWords(words1, words2) {
   return { ops, removed, added, words1, words2 };
 }
 
+// ── Image extraction & diff ───────────────────────────────────────────────────
+// Returns array of { x, y, w, h, pixelData, imgW, imgH } in canvas-space coords
+
+async function extractImages(pdf, pageNum, scrollId) {
+  if (pageNum > pdf.numPages) return [];
+  const page = await pdf.getPage(pageNum);
+  const base = page.getViewport({ scale: 1 });
+  const scale = getPanelWidth(scrollId) / base.width;
+  const viewport = page.getViewport({ scale });
+
+  const images = [];
+  try {
+    const opList = await page.getOperatorList();
+    const { OPS } = pdfjsLib;
+
+    // Walk operator list to find paintImageXObject calls and their current transform
+    // We maintain a simple transform stack to get each image's CTM
+    const transformStack = [[1,0,0,1,0,0]];
+    let currentTransform = [1,0,0,1,0,0];
+
+    for (let i = 0; i < opList.fnArray.length; i++) {
+      const fn = opList.fnArray[i];
+      const args = opList.argsArray[i];
+
+      if (fn === OPS.save) {
+        transformStack.push([...currentTransform]);
+      } else if (fn === OPS.restore) {
+        currentTransform = transformStack.pop() || [1,0,0,1,0,0];
+      } else if (fn === OPS.transform) {
+        // args = [a,b,c,d,e,f] — multiply onto current
+        currentTransform = multiplyMatrix(currentTransform, args);
+      } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintImageMaskXObject) {
+        // Get image data from page's objs
+        const imgName = args[0];
+        let imgData = null;
+        try {
+          imgData = await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('timeout')), 3000);
+            page.objs.get(imgName, obj => {
+              clearTimeout(timeout);
+              resolve(obj);
+            });
+          });
+        } catch { continue; }
+
+        if (!imgData || !imgData.data) continue;
+
+        // Map image corners through PDF→canvas transform
+        // PDF image is unit square [0,0]→[1,1] scaled by CTM, then by viewport
+        const ctm = currentTransform;
+        // The full transform = viewport.transform * ctm
+        const vt = viewport.transform; // [sx,0,0,sy,tx,ty] for non-rotated
+        const fullM = multiplyMatrix(vt, ctm);
+
+        // Corners of unit square in canvas space
+        const corners = [
+          applyMatrix(fullM, [0, 0]),
+          applyMatrix(fullM, [1, 0]),
+          applyMatrix(fullM, [1, 1]),
+          applyMatrix(fullM, [0, 1]),
+        ];
+        const xs = corners.map(c => c[0]), ys = corners.map(c => c[1]);
+        const x = Math.min(...xs), y = Math.min(...ys);
+        const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+
+        if (w < 4 || h < 4) continue; // skip tiny/invisible images
+
+        // Render the image to an offscreen canvas at its natural resolution for pixel comparison
+        const imgW = imgData.width, imgH = imgData.height;
+        const offscreen = document.createElement('canvas');
+        offscreen.width = imgW; offscreen.height = imgH;
+        const ctx = offscreen.getContext('2d');
+        const idata = ctx.createImageData(imgW, imgH);
+
+        // imgData.data may be Uint8ClampedArray (RGBA) or Uint8Array (RGB)
+        const src = imgData.data;
+        const channels = src.length / (imgW * imgH);
+        if (channels === 4) {
+          idata.data.set(src);
+        } else if (channels === 3) {
+          for (let p = 0; p < imgW * imgH; p++) {
+            idata.data[p*4]   = src[p*3];
+            idata.data[p*4+1] = src[p*3+1];
+            idata.data[p*4+2] = src[p*3+2];
+            idata.data[p*4+3] = 255;
+          }
+        } else if (channels === 1) {
+          for (let p = 0; p < imgW * imgH; p++) {
+            idata.data[p*4] = idata.data[p*4+1] = idata.data[p*4+2] = src[p];
+            idata.data[p*4+3] = 255;
+          }
+        } else { continue; }
+
+        ctx.putImageData(idata, 0, 0);
+        const pixelData = ctx.getImageData(0, 0, imgW, imgH);
+
+        images.push({ x, y, w, h, pixelData, imgW, imgH, name: imgName });
+      }
+    }
+  } catch (e) {
+    console.warn('Image extraction error:', e);
+  }
+  return images;
+}
+
+function multiplyMatrix(m1, m2) {
+  // Both are [a,b,c,d,e,f] representing 2D affine matrix
+  const [a1,b1,c1,d1,e1,f1] = m1;
+  const [a2,b2,c2,d2,e2,f2] = m2;
+  return [
+    a1*a2 + c1*b2,
+    b1*a2 + d1*b2,
+    a1*c2 + c1*d2,
+    b1*c2 + d1*d2,
+    a1*e2 + c1*f2 + e1,
+    b1*e2 + d1*f2 + f1,
+  ];
+}
+
+function applyMatrix(m, pt) {
+  return [m[0]*pt[0] + m[2]*pt[1] + m[4], m[1]*pt[0] + m[3]*pt[1] + m[5]];
+}
+
+// Compare images from two pages, matching by position index
+// Returns { changed1: [{x,y,w,h}], changed2: [{x,y,w,h}], count }
+function diffImages(images1, images2) {
+  const changed1 = [], changed2 = [];
+  const len = Math.max(images1.length, images2.length);
+
+  for (let i = 0; i < len; i++) {
+    const img1 = images1[i];
+    const img2 = images2[i];
+
+    if (!img1 && img2) {
+      // New image added
+      changed2.push({ x: img2.x, y: img2.y, w: img2.w, h: img2.h });
+    } else if (img1 && !img2) {
+      // Image removed
+      changed1.push({ x: img1.x, y: img1.y, w: img1.w, h: img1.h });
+    } else if (img1 && img2) {
+      // Both exist — compare pixel data
+      if (imagesAreDifferent(img1.pixelData, img2.pixelData)) {
+        changed1.push({ x: img1.x, y: img1.y, w: img1.w, h: img1.h });
+        changed2.push({ x: img2.x, y: img2.y, w: img2.w, h: img2.h });
+      }
+    }
+  }
+
+  return { changed1, changed2, count: Math.max(changed1.length, changed2.length) };
+}
+
+function imagesAreDifferent(pd1, pd2) {
+  // If dimensions differ, definitely different
+  if (pd1.width !== pd2.width || pd1.height !== pd2.height) return true;
+
+  const d1 = pd1.data, d2 = pd2.data;
+  const total = pd1.width * pd1.height;
+  const THRESHOLD = 15;        // per-channel difference to count a pixel as changed
+  const MAX_DIFF_RATIO = 0.01; // flag if >1% of pixels differ
+
+  let diffPixels = 0;
+  const step = 4; // check every pixel (RGBA stride)
+  for (let i = 0; i < d1.length; i += step) {
+    if (
+      Math.abs(d1[i]   - d2[i])   > THRESHOLD ||
+      Math.abs(d1[i+1] - d2[i+1]) > THRESHOLD ||
+      Math.abs(d1[i+2] - d2[i+2]) > THRESHOLD
+    ) {
+      diffPixels++;
+      if (diffPixels / total > MAX_DIFF_RATIO) return true;
+    }
+  }
+  return (diffPixels / total) > MAX_DIFF_RATIO;
+}
+
+function applyImageHighlights(overlayId, rects) {
+  if (!rects.length) return;
+  const overlay = document.getElementById(overlayId);
+  for (const r of rects) {
+    const el = document.createElement('div');
+    el.className = 'diff-rect image-changed';
+    el.style.cssText = `left:${Math.round(r.x)}px;top:${Math.round(r.y)}px;width:${Math.round(r.w)}px;height:${Math.round(r.h)}px`;
+    el.title = 'Image changed';
+    overlay.appendChild(el);
+  }
+}
+
 // ── Overlays ──────────────────────────────────────────────────────────────────
 
 function clearOverlay(id) { document.getElementById(id).innerHTML = ''; }
@@ -495,37 +693,55 @@ function applyWordHighlights(overlayId, wordList, viewport, cls) {
 
 // ── Text diff sidebar ─────────────────────────────────────────────────────────
 
-function renderTextDiffSidebar(textDiff) {
+function renderTextDiffSidebar(textDiff, imageDiff) {
   const scroll = document.getElementById('tdpScroll');
   const changeCount = textDiff.removed.length + textDiff.added.length;
-  document.getElementById('tdpWordCount').textContent = `${changeCount} word${changeCount !== 1 ? 's' : ''} changed`;
+  const imgCount = imageDiff ? imageDiff.count : 0;
+  const total = changeCount + imgCount;
+  document.getElementById('tdpWordCount').textContent = `${total} change${total !== 1 ? 's' : ''}`;
 
-  if (changeCount === 0) {
-    scroll.innerHTML = `<div class="diff-line context" style="color:var(--added-border);padding:8px 4px">✓ Pages are textually identical</div>`;
+  const lines = [];
+
+  // Image diff entries first
+  if (imgCount > 0) {
+    lines.push({ type: 'header', text: `── ${imgCount} IMAGE CHANGE${imgCount > 1 ? 'S' : ''} ──` });
+    const maxShow = Math.max(imageDiff.changed1.length, imageDiff.changed2.length);
+    for (let i = 0; i < maxShow; i++) {
+      const r1 = imageDiff.changed1[i], r2 = imageDiff.changed2[i];
+      if (r1 && !r2)       lines.push({ type: 'removed', text: `− Image ${i+1} removed` });
+      else if (!r1 && r2)  lines.push({ type: 'added',   text: `+ Image ${i+1} added` });
+      else                 lines.push({ type: 'added',   text: `~ Image ${i+1} content changed` });
+    }
+  }
+
+  if (changeCount === 0 && imgCount === 0) {
+    scroll.innerHTML = `<div class="diff-line context" style="color:var(--added-border);padding:8px 4px">✓ Pages are identical</div>`;
     return;
   }
 
+  if (changeCount === 0) {
+    scroll.innerHTML = lines.map(l => `<div class="diff-line ${l.type}">${escHtml(l.text)}</div>`).join('') +
+      `<div class="diff-line context" style="color:var(--added-border);padding:6px 4px">✓ No text differences</div>`;
+    return;
+  }
+
+  // Text diff entries
   const CONTEXT = 5;
   const { ops, words1, words2 } = textDiff;
-  const lines = [];
   let i = 0;
-
   while (i < ops.length) {
     if (ops[i].type === 'equal') { i++; continue; }
-
-    // Collect a contiguous cluster of non-equal ops
     const clStart = i;
     while (i < ops.length && ops[i].type !== 'equal') i++;
     const clEnd = i;
 
-    // Gather context words before/after
     const before = [], after = [];
     let ci = clStart - 1, cnt = 0;
     while (ci >= 0 && ops[ci].type === 'equal' && cnt < CONTEXT) { before.unshift(words1[ops[ci].ai].str); ci--; cnt++; }
     ci = clEnd; cnt = 0;
     while (ci < ops.length && ops[ci].type === 'equal' && cnt < CONTEXT) { after.push(words1[ops[ci].ai].str); ci++; cnt++; }
 
-    lines.push({ type: 'header', text: '── CHANGE ──' });
+    lines.push({ type: 'header', text: '── TEXT CHANGE ──' });
     if (before.length) lines.push({ type: 'context', text: (before.length < CONTEXT ? '' : '… ') + before.join(' ') });
 
     const delW = [], insW = [];
@@ -535,7 +751,6 @@ function renderTextDiffSidebar(textDiff) {
     }
     if (delW.length) lines.push({ type: 'removed', text: '− ' + delW.join(' ') });
     if (insW.length) lines.push({ type: 'added',   text: '+ ' + insW.join(' ') });
-
     if (after.length) lines.push({ type: 'context', text: after.join(' ') + (after.length < CONTEXT ? '' : ' …') });
   }
 
