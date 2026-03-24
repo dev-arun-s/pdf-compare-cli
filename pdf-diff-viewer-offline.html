@@ -534,39 +534,59 @@ function setupScrollSync() {
 // ── Background scan ───────────────────────────────────────────────────────────
 // Processes all pages in order, caching results and updating the page map live.
 
+// Null-safe textContent setter — backgroundScan runs async and the
+// elements it updates may be gone if the user resets mid-scan.
+function safeText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+let scanAborted = false;
+
 async function backgroundScan() {
-  document.getElementById('scanProgress').textContent = `Scanning 0 / ${totalPages}…`;
+  scanAborted = false;
+  safeText('scanProgress', `Scanning 0 / ${totalPages}…`);
   let changedCount = 0;
 
   for (let p = 1; p <= totalPages; p++) {
-    if (!pdf1 || !pdf2) break; // reset happened
+    if (scanAborted || !pdf1 || !pdf2) break;
 
-    const result = await computePageDiff(p);
+    let result;
+    try {
+      result = await computePageDiff(p);
+    } catch(e) {
+      if (scanAborted) break;
+      console.warn(`Scan error on page ${p}:`, e);
+      continue;
+    }
+
+    if (scanAborted || !pdf1 || !pdf2) break;
+
     pageCache[p] = result;
-
     const hasText = result.textDiff.removed.length + result.textDiff.added.length > 0;
     const hasImg  = result.imageDiff.count > 0;
     pageSummary[p] = { textChanges: result.textDiff.removed.length + result.textDiff.added.length, imgChanges: result.imageDiff.count };
 
     if (hasText || hasImg) changedCount++;
-    document.getElementById('statChangedPages').textContent = `${changedCount} / ${totalPages}`;
-    document.getElementById('changedPageCount').textContent = `${changedCount} of ${totalPages}`;
+    safeText('statChangedPages', `${changedCount} / ${totalPages}`);
+    safeText('changedPageCount', `${changedCount} of ${totalPages}`);
     renderPageMap(true, p);
-    document.getElementById('scanProgress').textContent = p < totalPages ? `Scanning ${p} / ${totalPages}…` : '';
+    safeText('scanProgress', p < totalPages ? `Scanning ${p} / ${totalPages}…` : '');
 
-    // If we just finished the current page's scan and it updated the cache,
-    // re-render the sidebar/stats for the current page without re-rendering the canvas
-    if (p === currentPage && !pageCache[p + '_rendered']) {
-      updateSidebarFromCache(p);
-    }
+    if (p === currentPage) updateSidebarFromCache(p);
   }
-  document.getElementById('scanProgress').style.display = 'none';
+
+  if (!scanAborted) {
+    const el = document.getElementById('scanProgress');
+    if (el) el.style.display = 'none';
+  }
 }
 
 // ── Page map ──────────────────────────────────────────────────────────────────
 
 function renderPageMap(withData, scannedUpTo) {
   const container = document.getElementById('pageMapScroll');
+  if (!container) return;
   let html = '';
   for (let p = 1; p <= totalPages; p++) {
     const sum = pageSummary[p];
@@ -675,7 +695,7 @@ function applyDiffToPage(diff, r1, r2, pageNum) {
 
 function updateSidebarFromCache(pageNum) {
   const diff = pageCache[pageNum];
-  if (!diff) return;
+  if (!diff || !document.getElementById('tdpScroll')) return;
   renderTextDiffSidebar(diff.textDiff, diff.imageDiff);
   document.getElementById('statWordRem').textContent    = diff.textDiff.removed.length;
   document.getElementById('statWordAdd').textContent    = diff.textDiff.added.length;
@@ -1296,6 +1316,7 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
 });
 
 document.getElementById('resetBtn').addEventListener('click', () => {
+  scanAborted = true;
   pdf1 = pdf2 = null;
   Object.keys(pageCache).forEach(k => delete pageCache[k]);
   Object.keys(pageSummary).forEach(k => delete pageSummary[k]);

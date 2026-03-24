@@ -26,7 +26,7 @@ PDFJS_VERSION  = "3.11.174"
 PDFJS_URL      = f"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/{PDFJS_VERSION}/pdf.min.js"
 WORKER_URL     = f"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/{PDFJS_VERSION}/pdf.worker.min.js"
 
-INPUT_HTML     = "pdf-diff-viewer-latest.html"
+INPUT_HTML     = "pdf-diff-viewer-latest-offline-generator.html"
 OUTPUT_HTML    = "pdf-diff-viewer-offline.html"
 
 PDFJS_MARKER_START = "/* ===== PDF.JS INLINE - DO NOT EDIT THIS LINE (used by bundle.py) ===== */"
