@@ -175,10 +175,11 @@
     flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px;
     background: #0a0a0c; scrollbar-width: thin; scrollbar-color: var(--border) transparent;
   }
-  .canvas-wrapper { position: relative; display: block; box-shadow: 0 4px 24px rgba(0,0,0,0.6); margin: 0 auto; transform-origin: top center; }
-  canvas { display: block; }
-  .diff-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .canvas-wrapper { position: relative; display: block; box-shadow: 0 4px 24px rgba(0,0,0,0.6); margin: 0 auto; }
+  canvas { display: block; width: 100%; height: auto; }
+  .diff-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
 
+  /* diff-rect positions are set as % via JS so they scale with any browser/CSS zoom */
   .diff-rect { position: absolute; border-radius: 2px; transition: opacity 0.2s; }
   .diff-rect.text-changed  { border: 2px solid rgba(255,200,0,0.9);  border-radius: 3px; box-shadow: 0 0 5px rgba(255,210,0,0.2); }
   .diff-rect.image-changed { border: 2px solid rgba(255,140,30,0.95); border-radius: 3px; box-shadow: 0 0 8px rgba(255,130,20,0.3); }
@@ -516,7 +517,12 @@ async function backgroundScan() {
     pageCache[p] = result;
     const hasText = result.textDiff.removed.length + result.textDiff.added.length > 0;
     const hasImg  = result.imageDiff.count > 0;
-    pageSummary[p] = { textChanges: result.textDiff.removed.length + result.textDiff.added.length, imgChanges: result.imageDiff.count };
+    pageSummary[p] = {
+      wordsRemoved: result.textDiff.removed.length,
+      wordsAdded:   result.textDiff.added.length,
+      textChanges:  result.textDiff.removed.length + result.textDiff.added.length,
+      imgChanges:   result.imageDiff.count
+    };
 
     if (hasText || hasImg) changedCount++;
     safeText('statChangedPages', `${changedCount} / ${totalPages}`);
@@ -579,30 +585,8 @@ async function computePageDiff(pageNum) {
   return { textDiff, imageDiff, words1, words2 };
 }
 
-// ── Page rendering ─────────────────────────────────────────────────────────────
-
-async function renderPage(pageNum) {
-  document.getElementById('statPage').textContent = `${pageNum} / ${totalPages}`;
-  document.getElementById('tdpPage').textContent = pageNum;
-
-  // Render canvases
-  const [r1, r2] = await Promise.all([
-    renderPDFPage(pdf1, pageNum, 'canvas1', 'wrapper1', 'scroll1'),
-    renderPDFPage(pdf2, pageNum, 'canvas2', 'wrapper2', 'scroll2'),
-  ]);
-
-  // Use cached diff if available, else compute now
-  let diff = pageCache[pageNum];
-  if (!diff) {
-    diff = await computePageDiff(pageNum);
-    pageCache[pageNum] = diff;
-  }
-
-  applyDiffToPage(diff, r1, r2, pageNum);
-  renderPageMap(true, Object.keys(pageSummary).length);
-}
-
 function applyDiffToPage(diff, r1, r2, pageNum) {
+  if (!r1 || !r2) return; // render was cancelled
   const { textDiff, imageDiff } = diff;
   const canvas1 = document.getElementById('canvas1');
   const canvas2 = document.getElementById('canvas2');
@@ -618,7 +602,6 @@ function applyDiffToPage(diff, r1, r2, pageNum) {
     const ir1  = applyImageHighlights('overlay1', imageDiff.changed1, canvas1);
     const ir2  = applyImageHighlights('overlay2', imageDiff.changed2, canvas2);
 
-    // Build paired highlight list for change navigator (match by index)
     const maxText = Math.max(rems.length, adds.length);
     for (let i = 0; i < maxText; i++) {
       allHighlights.push({ el1: rems[i] || null, el2: adds[i] || null, y: (rems[i] || adds[i]).offsetTop });
@@ -640,7 +623,6 @@ function applyDiffToPage(diff, r1, r2, pageNum) {
   document.getElementById('statWordAdd').textContent    = textDiff.added.length;
   document.getElementById('statImgChanged').textContent = imageDiff.count;
 
-  applyZoom();
   applyOpacity();
 }
 
@@ -655,6 +637,52 @@ function updateSidebarFromCache(pageNum) {
 
 // ── PDF page rendering ────────────────────────────────────────────────────────
 
+// Track active PDF.js render tasks so we can cancel them before re-rendering.
+const renderTasks = { canvas1: null, canvas2: null };
+
+// Prevent concurrent renderPage calls — only one at a time.
+let renderLock = false;
+let renderPending = false;
+
+async function renderPage(pageNum) {
+  // If a render is already running, mark that another is pending and return.
+  // The running render will kick off the pending one when it finishes.
+  if (renderLock) {
+    renderPending = true;
+    return;
+  }
+  renderLock = true;
+  renderPending = false;
+
+  try {
+    document.getElementById('statPage').textContent = `${pageNum} / ${totalPages}`;
+    document.getElementById('tdpPage').textContent = pageNum;
+
+    const [r1, r2] = await Promise.all([
+      renderPDFPage(pdf1, pageNum, 'canvas1', 'wrapper1', 'scroll1'),
+      renderPDFPage(pdf2, pageNum, 'canvas2', 'wrapper2', 'scroll2'),
+    ]);
+
+    if (!r1 || !r2) return; // cancelled mid-render
+
+    let diff = pageCache[pageNum];
+    if (!diff) {
+      diff = await computePageDiff(pageNum);
+      pageCache[pageNum] = diff;
+    }
+
+    applyDiffToPage(diff, r1, r2, pageNum);
+    renderPageMap(true, Object.keys(pageSummary).length);
+  } finally {
+    renderLock = false;
+    // If another render was requested while we were busy, run it now.
+    if (renderPending) {
+      renderPending = false;
+      renderPage(currentPage);
+    }
+  }
+}
+
 function getPanelWidth(scrollId) {
   const el = document.getElementById(scrollId);
   return Math.max(el.clientWidth - 24, 200);
@@ -663,6 +691,12 @@ function getPanelWidth(scrollId) {
 async function renderPDFPage(pdf, pageNum, canvasId, wrapperId, scrollId) {
   const canvas = document.getElementById(canvasId);
   const ctx = canvas.getContext('2d');
+
+  // Cancel any in-progress render on this canvas before starting a new one.
+  if (renderTasks[canvasId]) {
+    try { renderTasks[canvasId].cancel(); } catch(e) { /* already done */ }
+    renderTasks[canvasId] = null;
+  }
 
   if (pageNum > pdf.numPages) {
     const pw = getPanelWidth(scrollId);
@@ -676,21 +710,36 @@ async function renderPDFPage(pdf, pageNum, canvasId, wrapperId, scrollId) {
 
   const page = await pdf.getPage(pageNum);
   const base = page.getViewport({ scale: 1 });
-  const scale = getPanelWidth(scrollId) / base.width;
+  const scale = (getPanelWidth(scrollId) / base.width) * zoomLevel;
   const viewport = page.getViewport({ scale });
 
   canvas.width  = Math.floor(viewport.width);
   canvas.height = Math.floor(viewport.height);
   ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  const task = page.render({ canvasContext: ctx, viewport });
+  renderTasks[canvasId] = task;
+
+  try {
+    await task.promise;
+  } catch (e) {
+    // RenderingCancelledException is expected when we cancel — not an error.
+    if (e && e.name === 'RenderingCancelledException') return null;
+    throw e;
+  } finally {
+    if (renderTasks[canvasId] === task) renderTasks[canvasId] = null;
+  }
+
   syncWrapper(wrapperId, canvas);
   return { viewport, scale };
 }
 
 function syncWrapper(wrapperId, canvas) {
+  // The canvas has width:100%/height:auto via CSS, so the wrapper sizes itself
+  // naturally. We just clear any stale inline styles from previous renders.
   const w = document.getElementById(wrapperId);
-  w.style.width = canvas.width + 'px';
-  w.style.height = canvas.height + 'px';
+  w.style.width = '';
+  w.style.height = '';
 }
 
 // ── Text extraction ───────────────────────────────────────────────────────────
@@ -699,57 +748,78 @@ async function extractWords(pdf, pageNum, scrollId) {
   if (pageNum > pdf.numPages) return [];
   const page = await pdf.getPage(pageNum);
   const base = page.getViewport({ scale: 1 });
-  const scale = getPanelWidth(scrollId) / base.width;
+  const scale = (getPanelWidth(scrollId) / base.width) * zoomLevel;
   const viewport = page.getViewport({ scale });
   const content = await page.getTextContent();
-  const words = [];
-
-  // ── Table-aware grouping ──────────────────────────────────────────────────
-  // Group text items by row (same Y within tolerance), then sort each row by X.
-  // This ensures that when Jasper lays out a table, words are diffed in reading
-  // order (left→right, top→bottom) rather than the arbitrary order PDF stores them.
-  const ROW_TOLERANCE = 4; // px — items within this vertical range = same row
+  // item.transform is a 6-element matrix [a,b,c,d,e,f] in PDF user space.
+  // pdfjsLib.Util.transform(viewport.transform, item.transform) maps it to
+  // canvas space. The result is [a,b,c,d,tx,ty] where tx/ty is the glyph
+  // origin in canvas pixels.
+  //
+  // In PDF: Y axis points UP, origin is bottom-left of the page.
+  // viewport.transform already flips Y so ty is top-down canvas Y of the
+  // TEXT BASELINE (bottom of most capital letters).
+  //
+  // item.height is in PDF user-space units. We scale it and use it as the
+  // box height above the baseline.
 
   const items = [];
+  const ROW_TOLERANCE = 6;
+
   for (const item of content.items) {
     if (!item.str || !item.str.trim()) continue;
-    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-    const canvasX = tx[4], canvasY = tx[5];
-    const scaleX  = Math.sqrt(tx[0]*tx[0] + tx[1]*tx[1]);
-    const scaleY  = Math.sqrt(tx[2]*tx[2] + tx[3]*tx[3]);
-    const itemW   = item.width  * scaleX;
-    const itemH   = item.height * Math.abs(scaleY) || 12 * scale;
-    // Normalise text: collapse whitespace, trim — reduces noise from spacing diffs
+
+    // Full canvas-space transform for this item
+    const m = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    // m[4], m[5] = canvas X, Y of the glyph origin
+    // For standard upright text: m[0] ≈ fontSize*scale, m[3] ≈ -fontSize*scale
+    // The rendered font size in canvas pixels is the absolute value of m[3]
+    const fontSize = Math.abs(m[3]); // canvas-pixel font size
+    const tx = m[4];
+    const ty = m[5]; // this is the BASELINE Y in canvas pixels
+
+    // Width: item.width is in PDF text-space units; scale to canvas pixels
+    const w = item.width * scale;
+
+    // Height: use the fontSize directly. The highlight box spans from
+    // (baseline - fontSize) to baseline, which covers the full glyph body.
+    const h = fontSize;
+    // Top of the box = baseline - height  (move up from baseline)
+    const x = tx;
+    const y = ty - h;
+
+    if (w < 1 || h < 1) continue;
+
     const normStr = item.str.replace(/\s+/g, ' ').trim();
     if (!normStr) continue;
-    items.push({ normStr, rawStr: item.str, x: canvasX, y: canvasY, w: itemW, h: itemH });
+    items.push({ normStr, x, y, w, h, baseY: ty });
   }
 
-  // Sort into rows
-  items.sort((a, b) => a.y - b.y || a.x - b.x);
+  // ── Table-aware: sort into rows by baseline, then left→right ─────────────
+  items.sort((a, b) => a.baseY - b.baseY || a.x - b.x);
   const rows = [];
   for (const item of items) {
     const lastRow = rows[rows.length - 1];
-    if (lastRow && Math.abs(item.y - lastRow[0].y) <= ROW_TOLERANCE) {
+    if (lastRow && Math.abs(item.baseY - lastRow[0].baseY) <= ROW_TOLERANCE) {
       lastRow.push(item);
     } else {
       rows.push([item]);
     }
   }
 
-  // Within each row, sort left→right and tokenise into words
+  // Tokenise each row left→right into individual words with proportional widths
+  const words = [];
   for (const row of rows) {
     row.sort((a, b) => a.x - b.x);
     for (const item of row) {
-      const tokens = item.normStr.split(/\s+/);
-      const totalChars = item.normStr.length || 1;
+      const tokens = item.normStr.split(/\s+/).filter(Boolean);
+      if (tokens.length === 0) continue;
+      const totalChars = tokens.reduce((s, t) => s + t.length, 0) || 1;
       let cx = item.x;
       for (const token of tokens) {
         const tw = (token.length / totalChars) * item.w;
-        if (token) {
-          words.push({ str: token, x: cx, y: item.y - item.h, w: tw, h: item.h });
-        }
-        cx += tw + (item.w / totalChars); // small gap for space
+        words.push({ str: token, x: cx, y: item.y, w: tw, h: item.h });
+        cx += tw;
       }
     }
   }
@@ -811,7 +881,7 @@ async function extractImageBBoxes(pdf, pageNum, scrollId) {
   if (pageNum > pdf.numPages) return [];
   const page = await pdf.getPage(pageNum);
   const base = page.getViewport({ scale: 1 });
-  const scale = getPanelWidth(scrollId) / base.width;
+  const scale = (getPanelWidth(scrollId) / base.width) * zoomLevel;
   const viewport = page.getViewport({ scale });
   const boxes = [];
   try {
@@ -903,29 +973,34 @@ async function diffImages(boxes1, boxes2, pdf1, pdf2, pageNum) {
   return { changed1, changed2, count: Math.max(changed1.length, changed2.length) };
 }
 
-function fracToPixels(box, canvas) {
-  return { x: Math.round(box.xFrac*canvas.width), y: Math.round(box.yFrac*canvas.height), w: Math.round(box.wFrac*canvas.width), h: Math.round(box.hFrac*canvas.height) };
-}
-
 // ── Overlays ──────────────────────────────────────────────────────────────────
 
 function clearOverlay(id) { document.getElementById(id).innerHTML = ''; }
-function setOverlaySize(oid, cid) {
-  const c = document.getElementById(cid), o = document.getElementById(oid);
-  o.style.width = c.width + 'px'; o.style.height = c.height + 'px';
-}
 
-// Returns array of created elements
+// Overlay is now 100% width/height of canvas via CSS — nothing to set here.
+// We position diff-rects as percentages so they scale with any browser zoom.
+function setOverlaySize(oid, cid) { /* no-op — handled by CSS */ }
+
+// Returns array of created elements.
+// Positions are stored as % of canvas pixel buffer dimensions so they remain
+// correct regardless of CSS zoom, browser zoom, or window resize.
 function applyWordHighlights(overlayId, wordList, viewport, cls) {
   if (!viewport || !wordList.length) return [];
+  const canvas = document.getElementById(overlayId.replace('overlay', 'canvas'));
+  if (!canvas || !canvas.width || !canvas.height) return [];
+  const cw = canvas.width, ch = canvas.height;
   const overlay = document.getElementById(overlayId);
-  const PAD = 1;
+  const PAD = 0.3; // % padding around each word
   const els = [];
   for (const word of wordList) {
     if (word.w < 1 || word.h < 1) continue;
     const el = document.createElement('div');
     el.className = `diff-rect ${cls}`;
-    el.style.cssText = `left:${word.x-PAD}px;top:${word.y-PAD}px;width:${word.w+PAD*2}px;height:${word.h+PAD*2}px;background:rgba(255,220,0,${highlightOpacity})`;
+    const left   = ((word.x - 1) / cw * 100).toFixed(3);
+    const top    = ((word.y - 1) / ch * 100).toFixed(3);
+    const width  = ((word.w + 2) / cw * 100).toFixed(3);
+    const height = ((word.h + 2) / ch * 100).toFixed(3);
+    el.style.cssText = `left:${left}%;top:${top}%;width:${width}%;height:${height}%;background:rgba(255,220,0,${highlightOpacity})`;
     el.title = word.str;
     overlay.appendChild(el);
     els.push(el);
@@ -938,10 +1013,14 @@ function applyImageHighlights(overlayId, rects, canvas) {
   const overlay = document.getElementById(overlayId);
   const els = [];
   for (const r of rects) {
-    const px = fracToPixels(r, canvas);
     const el = document.createElement('div');
     el.className = 'diff-rect image-changed';
-    el.style.cssText = `left:${px.x}px;top:${px.y}px;width:${px.w}px;height:${px.h}px;background:rgba(255,120,30,${highlightOpacity * 0.65})`;
+    // rects are already stored as fractions — convert directly to %
+    const left   = (r.xFrac * 100).toFixed(3);
+    const top    = (r.yFrac * 100).toFixed(3);
+    const width  = (r.wFrac * 100).toFixed(3);
+    const height = (r.hFrac * 100).toFixed(3);
+    el.style.cssText = `left:${left}%;top:${top}%;width:${width}%;height:${height}%;background:rgba(255,120,30,${highlightOpacity * 0.65})`;
     el.title = 'Image changed';
     overlay.appendChild(el);
     els.push(el);
@@ -952,15 +1031,16 @@ function applyImageHighlights(overlayId, rects, canvas) {
 // ── Zoom ──────────────────────────────────────────────────────────────────────
 
 function applyZoom() {
-  ['wrapper1','wrapper2'].forEach(id => {
-    document.getElementById(id).style.transform = `scale(${zoomLevel})`;
-  });
+  delete pageCache[currentPage];
+  renderPage(currentPage);
 }
 
+let zoomTimer;
 document.getElementById('zoomSlider').addEventListener('input', e => {
   zoomLevel = parseInt(e.target.value) / 100;
   document.getElementById('zoomLabel').textContent = `${e.target.value}%`;
-  applyZoom();
+  clearTimeout(zoomTimer);
+  zoomTimer = setTimeout(applyZoom, 150);
 });
 
 // ── Opacity ───────────────────────────────────────────────────────────────────
@@ -1007,7 +1087,7 @@ function scrollToChange(idx) {
   if (el) {
     const scrollEl = el.closest('.canvas-scroll');
     if (scrollEl) {
-      const offsetTop = el.offsetTop * zoomLevel;
+      const offsetTop = el.offsetTop;
       scrollEl.scrollTop = Math.max(0, offsetTop - scrollEl.clientHeight / 3);
     }
   }
@@ -1120,7 +1200,7 @@ function exportCsv() {
     const s = pageSummary[p];
     if (s) {
       const hasChange = (s.textChanges > 0 || s.imgChanges > 0) ? 'YES' : 'no';
-      rows.push([p, s.textChanges, s.imgChanges > 0 ? s.imgChanges : 0, hasChange]);
+      rows.push([p, s.wordsRemoved, s.wordsAdded, s.imgChanges, hasChange]);
     } else {
       rows.push([p, '(not scanned)', '(not scanned)', '(not scanned)', '(not scanned)']);
     }
@@ -1190,7 +1270,7 @@ function exportHtml() {
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
           <strong style="font-size:14px">Page ${p}</strong>
           ${badge}
-          ${s ? `<span style="font-size:11px;color:#6b7280">${s.textChanges} word changes · ${s.imgChanges} image changes</span>` : ''}
+          ${s ? `<span style="font-size:11px;color:#6b7280">${s.wordsRemoved} removed · ${s.wordsAdded} added · ${s.imgChanges} image change${s.imgChanges !== 1 ? 's' : ''}</span>` : ''}
         </div>
         ${textSection}
       </div>`;
@@ -1268,6 +1348,11 @@ document.querySelectorAll('.mode-tab').forEach(tab => {
 
 document.getElementById('resetBtn').addEventListener('click', () => {
   scanAborted = true;
+  // Cancel any in-progress renders
+  Object.keys(renderTasks).forEach(k => {
+    if (renderTasks[k]) { try { renderTasks[k].cancel(); } catch(e) {} renderTasks[k] = null; }
+  });
+  renderLock = false; renderPending = false;
   pdf1 = pdf2 = null;
   Object.keys(pageCache).forEach(k => delete pageCache[k]);
   Object.keys(pageSummary).forEach(k => delete pageSummary[k]);
