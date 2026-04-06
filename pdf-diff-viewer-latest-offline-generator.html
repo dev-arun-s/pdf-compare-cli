@@ -500,42 +500,106 @@ async function backgroundScan() {
   safeText('scanProgress', `Scanning 0 / ${totalPages}…`);
   let changedCount = 0;
 
-  for (let p = 1; p <= totalPages; p++) {
-    if (scanAborted || !pdf1 || !pdf2) break;
+  // ── Phase 1: Text diff only (fast — no offscreen renders) ────────────────
+  // This fills the page map quickly so the user can navigate immediately.
+  const pagesWithImages = []; // pages that have images, need Phase 2
 
-    let result;
+  for (let p = 1; p <= totalPages; p++) {
+    if (scanAborted || !pdf1 || !pdf2) return;
+
+    // Yield to browser between every page so UI stays responsive
+    await yieldToUI();
+    if (scanAborted || !pdf1 || !pdf2) return;
+
+    let textResult, bboxResult;
     try {
-      result = await computePageDiff(p);
+      [textResult, bboxResult] = await Promise.all([
+        computeTextDiff(p),
+        computeImageBBoxes(p),
+      ]);
     } catch(e) {
-      if (scanAborted) break;
+      if (scanAborted) return;
       console.warn(`Scan error on page ${p}:`, e);
       continue;
     }
 
-    if (scanAborted || !pdf1 || !pdf2) break;
+    if (scanAborted || !pdf1 || !pdf2) return;
 
-    pageCache[p] = result;
-    const hasText = result.textDiff.removed.length + result.textDiff.added.length > 0;
-    const hasImg  = result.imageDiff.count > 0;
+    const hasText = textResult.textDiff.removed.length + textResult.textDiff.added.length > 0;
+
+    // Store partial result — imageDiff will be filled in Phase 2
+    const partial = {
+      textDiff:  textResult.textDiff,
+      imageDiff: { changed1: [], changed2: [], count: 0 }, // placeholder
+      words1:    textResult.words1,
+      words2:    textResult.words2,
+      _boxes1:   bboxResult.boxes1,  // stash for Phase 2
+      _boxes2:   bboxResult.boxes2,
+      _imgPending: bboxResult.hasImages, // needs Phase 2 pixel check
+    };
+    pageCache[p] = partial;
+
     pageSummary[p] = {
-      wordsRemoved: result.textDiff.removed.length,
-      wordsAdded:   result.textDiff.added.length,
-      textChanges:  result.textDiff.removed.length + result.textDiff.added.length,
-      imgChanges:   result.imageDiff.count
+      wordsRemoved: textResult.textDiff.removed.length,
+      wordsAdded:   textResult.textDiff.added.length,
+      textChanges:  textResult.textDiff.removed.length + textResult.textDiff.added.length,
+      imgChanges:   0, // updated in Phase 2
+      imgPending:   bboxResult.hasImages,
     };
 
-    if (hasText || hasImg) changedCount++;
+    if (hasText) changedCount++;
     safeText('statChangedPages', `${changedCount} / ${totalPages}`);
     safeText('changedPageCount', `${changedCount} of ${totalPages}`);
     renderPageMap(true, p);
-    safeText('scanProgress', p < totalPages ? `Scanning ${p} / ${totalPages}…` : '');
+    safeText('scanProgress', p < totalPages ? `Scanning ${p} / ${totalPages}…` : 'Checking images…');
 
+    if (bboxResult.hasImages) pagesWithImages.push(p);
+    if (p === currentPage) updateSidebarFromCache(p);
+  }
+
+  // ── Phase 2: Image pixel comparison (slow — offscreen renders) ───────────
+  // Only runs on pages that actually contain images. Yields between each page.
+  for (const p of pagesWithImages) {
+    if (scanAborted || !pdf1 || !pdf2) return;
+
+    await yieldToUI();
+    if (scanAborted || !pdf1 || !pdf2) return;
+
+    const cached = pageCache[p];
+    if (!cached || !cached._imgPending) continue;
+
+    let imageDiff;
+    try {
+      imageDiff = await diffImages(cached._boxes1, cached._boxes2, pdf1, pdf2, p);
+    } catch(e) {
+      if (scanAborted) return;
+      console.warn(`Image diff error on page ${p}:`, e);
+      continue;
+    }
+
+    if (scanAborted || !pdf1 || !pdf2) return;
+
+    cached.imageDiff    = imageDiff;
+    cached._imgPending  = false;
+
+    const wasChanged = pageSummary[p].textChanges > 0;
+    pageSummary[p].imgChanges = imageDiff.count;
+    if (!wasChanged && imageDiff.count > 0) changedCount++;
+
+    safeText('statChangedPages', `${changedCount} / ${totalPages}`);
+    safeText('changedPageCount', `${changedCount} of ${totalPages}`);
+    renderPageMap(true, totalPages);
+
+    // Refresh current page display if image diff changed it
     if (p === currentPage) updateSidebarFromCache(p);
   }
 
   if (!scanAborted) {
+    safeText('scanProgress', '');
     const el = document.getElementById('scanProgress');
     if (el) el.style.display = 'none';
+    safeText('statChangedPages', `${changedCount} / ${totalPages}`);
+    safeText('changedPageCount', `${changedCount} of ${totalPages}`);
   }
 }
 
@@ -570,8 +634,33 @@ function renderPageMap(withData, scannedUpTo) {
   });
 }
 
-// ── Core diff computation (separated from rendering) ──────────────────────────
+// ── Core diff computation ─────────────────────────────────────────────────────
 
+// Yield to the browser event loop so the UI stays responsive between heavy ops.
+function yieldToUI() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+// Fast: text diff only — used by background scan (no offscreen renders)
+async function computeTextDiff(pageNum) {
+  const [words1, words2] = await Promise.all([
+    extractWords(pdf1, pageNum, 'scroll1'),
+    extractWords(pdf2, pageNum, 'scroll2'),
+  ]);
+  const textDiff = diffWords(words1, words2);
+  return { textDiff, words1, words2 };
+}
+
+// Fast: image bbox detection only — no pixel comparison
+async function computeImageBBoxes(pageNum) {
+  const [boxes1, boxes2] = await Promise.all([
+    extractImageBBoxes(pdf1, pageNum, 'scroll1'),
+    extractImageBBoxes(pdf2, pageNum, 'scroll2'),
+  ]);
+  return { boxes1, boxes2, hasImages: boxes1.length > 0 || boxes2.length > 0 };
+}
+
+// Full: text + image pixel comparison — used when viewing a page
 async function computePageDiff(pageNum) {
   const [words1, words2, boxes1, boxes2] = await Promise.all([
     extractWords(pdf1, pageNum, 'scroll1'),
@@ -579,7 +668,6 @@ async function computePageDiff(pageNum) {
     extractImageBBoxes(pdf1, pageNum, 'scroll1'),
     extractImageBBoxes(pdf2, pageNum, 'scroll2'),
   ]);
-
   const textDiff  = diffWords(words1, words2);
   const imageDiff = await diffImages(boxes1, boxes2, pdf1, pdf2, pageNum);
   return { textDiff, imageDiff, words1, words2 };
@@ -669,6 +757,12 @@ async function renderPage(pageNum) {
     if (!diff) {
       diff = await computePageDiff(pageNum);
       pageCache[pageNum] = diff;
+    } else if (diff._imgPending) {
+      // Phase 1 ran (text only) but image diff not yet done — compute it now
+      const imageDiff = await diffImages(diff._boxes1, diff._boxes2, pdf1, pdf2, pageNum);
+      diff.imageDiff   = imageDiff;
+      diff._imgPending = false;
+      if (pageSummary[pageNum]) pageSummary[pageNum].imgChanges = imageDiff.count;
     }
 
     applyDiffToPage(diff, r1, r2, pageNum);
@@ -918,7 +1012,7 @@ function mat_mul(m1, m2) {
 }
 function mat_apply(m, pt) { return [m[0]*pt[0]+m[2]*pt[1]+m[4], m[1]*pt[0]+m[3]*pt[1]+m[5]]; }
 
-const IMG_COMPARE_SCALE = 1.5;
+const IMG_COMPARE_SCALE = 0.5; // low res is fine for detecting image changes
 async function renderPageOffscreen(pdf, pageNum) {
   if (pageNum > pdf.numPages) return null;
   const page = await pdf.getPage(pageNum);
